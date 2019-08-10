@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifi// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *  SR-IPv6 implementation
  *
@@ -29,6 +29,7 @@
 #include <net/seg6_local.h>
 #include <linux/etherdevice.h>
 #include <linux/bpf.h>
+#include <linux/inetdevice.h>
 
 struct seg6_local_lwt;
 
@@ -394,6 +395,290 @@ drop:
 	return -EINVAL;
 }
 
+static int seg6_table4_lookup(struct sk_buff *skb, u32 tbl_id)
+{
+	struct iphdr *iph;
+	struct fib_result res;
+	int err = -EINVAL;
+	struct fib_table *table;
+	struct net *net = dev_net(skb->dev);
+	struct flowi4	fl4;
+	struct in_device *in_dev;
+	struct in_device *out_dev;
+	struct net_device *dev;
+	struct rtable *rth = NULL;
+	struct dst_entry *dst = NULL;
+	struct rtable *orig, *prev, **p;
+	struct fib_nh_common *nhc = NULL;
+	unsigned int flags = 0;
+	bool nopolicy = false;
+	bool noxfrm = false;
+	u16 type = RTN_UNREACHABLE;
+	bool do_cache = true;
+
+	iph = ip_hdr(skb);
+
+	/* Get a working reference to the input device */
+	in_dev = __in_dev_get_rcu(skb->dev);
+	if (!in_dev)
+		return -EINVAL;
+
+	/* Multicast destination */
+	if (ipv4_is_multicast(iph->daddr))
+		return ip_route_input(skb, iph->daddr, iph->saddr, 0, skb->dev);
+
+	/* Martian source */
+	if (ipv4_is_multicast(iph->saddr) || ipv4_is_lbcast(iph->saddr))
+		return -EINVAL;
+
+	/* Broadcast destination */
+	if (ipv4_is_lbcast(iph->daddr) || (iph->saddr == 0 && iph->daddr == 0)) {
+		dev = net->loopback_dev;
+		noxfrm = false;
+		flags = RTCF_BROADCAST | RTCF_LOCAL;
+		goto mk_route;
+	}
+
+	/* Martian source or destination */
+	if (ipv4_is_zeronet(iph->saddr) || ipv4_is_zeronet(iph->daddr))
+		return -EINVAL;
+
+	if (ipv4_is_loopback(iph->daddr)) {
+		/* Martian destination */
+		if (!IN_DEV_NET_ROUTE_LOCALNET(in_dev, net))
+			return -EINVAL;
+	} else if (ipv4_is_loopback(iph->saddr)) {
+		/* Martian source */
+		if (!IN_DEV_NET_ROUTE_LOCALNET(in_dev, net))
+			return -EINVAL;
+	}
+
+	/* Route the packet */
+	fl4.flowi4_oif = 0;
+	fl4.flowi4_iif = skb->dev->ifindex;
+	fl4.flowi4_mark = skb->mark;
+	fl4.flowi4_tos = 0;
+	fl4.flowi4_flags = 0;
+	fl4.daddr = iph->daddr;
+	fl4.saddr = iph->saddr;
+	fl4.flowi4_scope = RT_SCOPE_UNIVERSE;
+	fl4.flowi4_uid = sock_net_uid(net, NULL);
+
+	/* Get routing table */
+	table = fib_get_table(net, tbl_id);
+	if (!table)
+		goto no_route;
+
+	/* Lookup into the DT4 table */
+	err = fib_table_lookup(table, &fl4, &res, FIB_LOOKUP_NOREF);
+	if (err)
+		goto no_route;
+
+	if (res.fi)
+		nhc = FIB_RES_NHC(res);
+
+	/* Check if the route is stored in cache */
+	if (do_cache && nhc) {
+		rth = rcu_dereference(nhc->nhc_rth_input);
+
+		if (rth && rth->dst.obsolete == DST_OBSOLETE_FORCE_CHK && rth->rt_genid == rt_genid_ipv4(dev_net(rth->dst.dev))) {
+			skb_dst_set_noref(skb, &rth->dst);
+			return 0;
+		}
+	}
+
+	switch(res.type) {
+		case RTN_BROADCAST:
+			/* Broadcast forwarding is enabled on this interface */
+			nopolicy = IN_DEV_CONF_GET(in_dev, NOPOLICY);
+			type = RTN_BROADCAST;
+			if (IN_DEV_BFORWARD(in_dev)) {
+				/* Get a working reference to the output device */
+				out_dev = __in_dev_get_rcu(FIB_RES_DEV(res));
+				if (!out_dev)
+					return -EINVAL;
+				dev = out_dev->dev;
+				noxfrm = IN_DEV_CONF_GET(out_dev, NOXFRM);
+				flags = 0;
+			}
+			else {
+				/* not do cache if bc_forwarding is enabled */
+				if (IPV4_DEVCONF_ALL(net, BC_FORWARDING))
+					do_cache = false;
+				dev = net->loopback_dev;
+				noxfrm = false;
+				flags = RTCF_BROADCAST | RTCF_LOCAL;
+			}
+			break;
+		case RTN_LOCAL:
+			dev = net->loopback_dev;
+			nopolicy = IN_DEV_CONF_GET(in_dev, NOPOLICY);
+			noxfrm = false;
+			flags = RTCF_LOCAL;
+			type = RTN_LOCAL;
+			break;
+		case RTN_UNICAST:
+			/* Forwarding is disabled on this interface */
+			if (!IN_DEV_FORWARD(in_dev))
+				goto no_route;
+
+			/* Get a working reference to the output device */
+			out_dev = __in_dev_get_rcu(FIB_RES_DEV(res));
+			if (!out_dev)
+				return -EINVAL;
+
+			dev = out_dev->dev;
+			nopolicy = IN_DEV_CONF_GET(in_dev, NOPOLICY);
+			noxfrm = IN_DEV_CONF_GET(out_dev, NOXFRM);
+			flags = 0;
+			type = RTN_UNICAST;
+			break;
+		default:
+			/* Martian destination */
+			return -EINVAL;
+	}
+
+	/* Make route */
+
+mk_route:
+	rth = rt_dst_alloc(dev,
+		   flags, type, nopolicy, noxfrm, do_cache);
+	if (!rth)
+		return -ENOBUFS;
+
+	if (flags & RTCF_LOCAL)
+		rth->dst.input = ip_local_deliver;
+	else
+		rth->dst.input = ip_forward;
+
+	if (nhc) {
+		if (!(flags & RTCF_LOCAL)) {
+			if (nhc->nhc_gw_family && nhc->nhc_scope == RT_SCOPE_LINK) {
+				rth->rt_gw_family = nhc->nhc_gw_family;
+				/* only INET and INET6 are supported */
+				if (likely(nhc->nhc_gw_family == AF_INET))
+					rth->rt_gw4 = nhc->nhc_gw.ipv4;
+				else
+					rth->rt_gw6 = nhc->nhc_gw.ipv6;
+			}
+
+			ip_dst_init_metrics(&rth->dst, res.fi->fib_metrics);
+
+			if (!rth->rt_gw4) {
+				rth->rt_gw_family = AF_INET;
+				rth->rt_gw4 = iph->daddr;
+			}
+		}
+
+		rth->dst.lwtstate = lwtstate_get(nhc->nhc_lwtstate);
+		if (flags & RTCF_LOCAL) {
+			if (lwtunnel_input_redirect(rth->dst.lwtstate)) {
+				rth->dst.lwtstate->orig_input = rth->dst.input;
+				rth->dst.input = lwtunnel_input;
+			}
+		}
+		else
+			lwtunnel_set_redirect(&rth->dst);
+	}
+
+	goto out;
+
+no_route:
+	rth = rt_dst_alloc(net->loopback_dev,
+		   0, RTN_UNREACHABLE,
+		   IN_DEV_CONF_GET(in_dev, NOPOLICY), false, false);
+	if (!rth)
+		return -ENOBUFS;
+
+	rth->dst.error= -err;
+	rth->rt_is_input = 1;
+
+	dst = &rth->dst;
+
+	skb_dst_drop(skb);
+	skb_dst_set(skb, dst);
+
+	return -EHOSTUNREACH;
+
+out:
+	rth->rt_is_input = 1;
+
+	dst = &rth->dst;
+
+	skb_dst_drop(skb);
+	skb_dst_set(skb, dst);
+
+	/* Cache the route in the next-hop */
+	p = (struct rtable **)&nhc->nhc_rth_input;
+	orig = *p;
+
+	dst_hold(&rth->dst);
+	prev = cmpxchg(p, orig, rth);
+	if (prev == orig) {
+		if (orig) {
+			dst_dev_put(&orig->dst);
+			dst_release(&orig->dst);
+		}
+	} else {
+		dst_release(&rth->dst);
+	}
+
+	return 0;
+}
+
+static int input_action_end_dt4(struct sk_buff *skb,
+				struct seg6_local_lwt *slwt)
+{
+	int err;
+
+	if (!decap_and_validate(skb, IPPROTO_IPIP))
+		goto drop;
+
+	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+		goto drop;
+
+	skb->protocol = htons(ETH_P_IP);
+
+	skb_set_transport_header(skb, sizeof(struct iphdr));
+
+	err = seg6_table4_lookup(skb, slwt->table);
+	if (err)
+		goto drop;
+
+	return dst_input(skb);
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
+static int input_action_end_dt46(struct sk_buff *skb,
+				struct seg6_local_lwt *slwt)
+{
+	struct ipv6_sr_hdr *srh;
+	unsigned int off = 0;
+	int proto;
+
+	srh = get_srh(skb);
+	if (srh && srh->segments_left > 0)
+		goto drop;
+
+#ifdef CONFIG_IPV6_SEG6_HMAC
+	if (srh && !seg6_hmac_validate_skb(skb))
+		goto drop;
+#endif
+	proto = ipv6_find_hdr(skb, &off, -1, NULL, NULL);
+
+ 	if (proto == IPPROTO_IPIP)
+		return input_action_end_dt4(skb, slwt);
+
+ 	if (proto == IPPROTO_IPV6)
+		return input_action_end_dt6(skb, slwt);
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
 /* push an SRH on top of the current one */
 static int input_action_end_b6(struct sk_buff *skb, struct seg6_local_lwt *slwt)
 {
@@ -568,6 +853,11 @@ static struct seg6_action_desc seg6_action_table[] = {
 		.input		= input_action_end_dt6,
 	},
 	{
+		.action		= SEG6_LOCAL_ACTION_END_DT4,
+		.attrs		= (1 << SEG6_LOCAL_TABLE),
+		.input		= input_action_end_dt4,
+	},
+	{
 		.action		= SEG6_LOCAL_ACTION_END_B6,
 		.attrs		= (1 << SEG6_LOCAL_SRH),
 		.input		= input_action_end_b6,
@@ -582,6 +872,11 @@ static struct seg6_action_desc seg6_action_table[] = {
 		.action		= SEG6_LOCAL_ACTION_END_BPF,
 		.attrs		= (1 << SEG6_LOCAL_BPF),
 		.input		= input_action_end_bpf,
+	},
+	{
+		.action		= SEG6_LOCAL_ACTION_END_DT46,
+		.attrs		= (1 << SEG6_LOCAL_TABLE),
+		.input		= input_action_end_dt46,
 	},
 
 };
@@ -1108,3 +1403,5 @@ void seg6_local_exit(void)
 {
 	lwtunnel_encap_del_ops(&seg6_local_ops, LWTUNNEL_ENCAP_SEG6_LOCAL);
 }
+
+
