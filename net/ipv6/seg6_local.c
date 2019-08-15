@@ -427,6 +427,8 @@ static int seg6_table4_lookup(struct sk_buff *skb, u32 tbl_id)
 	if (ipv4_is_multicast(iph->daddr))
 		return ip_route_input(skb, iph->daddr, iph->saddr, 0, skb->dev);
 
+	skb_dst_drop(skb);
+
 	/* Martian source */
 	if (ipv4_is_multicast(iph->saddr) || ipv4_is_lbcast(iph->saddr))
 		return -EINVAL;
@@ -581,49 +583,45 @@ mk_route:
 			lwtunnel_set_redirect(&rth->dst);
 	}
 
+	err = 0;
 	goto out;
 
 no_route:
+	do_cache = false;
+	err = -EHOSTUNREACH;
 	rth = rt_dst_alloc(net->loopback_dev,
 		   0, RTN_UNREACHABLE,
-		   IN_DEV_CONF_GET(in_dev, NOPOLICY), false, false);
+		   IN_DEV_CONF_GET(in_dev, NOPOLICY), false, do_cache);
 	if (!rth)
 		return -ENOBUFS;
 
 	rth->dst.error= -err;
-	rth->rt_is_input = 1;
-
-	dst = &rth->dst;
-
-	skb_dst_drop(skb);
-	skb_dst_set(skb, dst);
-
-	return -EHOSTUNREACH;
 
 out:
 	rth->rt_is_input = 1;
 
 	dst = &rth->dst;
 
-	skb_dst_drop(skb);
 	skb_dst_set(skb, dst);
 
 	/* Cache the route in the next-hop */
-	p = (struct rtable **)&nhc->nhc_rth_input;
-	orig = *p;
+	if (do_cache) {
+		p = (struct rtable **)&nhc->nhc_rth_input;
+		orig = *p;
 
-	dst_hold(&rth->dst);
-	prev = cmpxchg(p, orig, rth);
-	if (prev == orig) {
-		if (orig) {
-			dst_dev_put(&orig->dst);
-			dst_release(&orig->dst);
+		dst_hold(&rth->dst);
+		prev = cmpxchg(p, orig, rth);
+		if (prev == orig) {
+			if (orig) {
+				dst_dev_put(&orig->dst);
+				dst_release(&orig->dst);
+			}
+		} else {
+			dst_release(&rth->dst);
 		}
-	} else {
-		dst_release(&rth->dst);
 	}
 
-	return 0;
+	return err;
 }
 
 static int input_action_end_dt4(struct sk_buff *skb,
