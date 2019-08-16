@@ -2080,8 +2080,11 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		fl4.fl4_sport = 0;
 		fl4.fl4_dport = 0;
 	}
+	if (res->table)
+		err = fib_table_lookup(res->table, &fl4, res, FIB_LOOKUP_NOREF);
+	else
+		err = fib_lookup(net, &fl4, res, 0);
 
-	err = fib_lookup(net, &fl4, res, 0);
 	if (err != 0) {
 		if (!IN_DEV_FORWARD(in_dev))
 			err = -EHOSTUNREACH;
@@ -2159,7 +2162,7 @@ local_input:
 	if (res->type == RTN_UNREACHABLE) {
 		rth->dst.input= ip_error;
 		rth->dst.error= -err;
-		rth->rt_flags 	&= ~RTCF_LOCAL;
+		rth->rt_flags 	&= RTCF_LOCAL;
 	}
 
 	if (do_cache) {
@@ -2217,6 +2220,7 @@ int ip_route_input_noref(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	int err;
 
 	tos &= IPTOS_RT_MASK;
+	res.table = NULL;
 	rcu_read_lock();
 	err = ip_route_input_rcu(skb, daddr, saddr, tos, dev, &res);
 	rcu_read_unlock();
@@ -2317,7 +2321,7 @@ static struct rtable *__mkroute_output(const struct fib_result *res,
 		flags |= RTCF_MULTICAST | RTCF_LOCAL;
 		if (!ip_check_mc_rcu(in_dev, fl4->daddr, fl4->saddr,
 				     fl4->flowi4_proto))
-			flags &= ~RTCF_LOCAL;
+			flags &= RTCF_LOCAL;
 		else
 			do_cache = false;
 		/* If multicast route do not exist use
@@ -2721,7 +2725,7 @@ static int rt_fill_info(struct net *net, __be32 dst, __be32 src,
 	r->rtm_type	= rt->rt_type;
 	r->rtm_scope	= RT_SCOPE_UNIVERSE;
 	r->rtm_protocol = RTPROT_UNSPEC;
-	r->rtm_flags	= (rt->rt_flags & ~0xFFFF) | RTM_F_CLONED;
+	r->rtm_flags	= (rt->rt_flags & 0xFFFF) | RTM_F_CLONED;
 	if (rt->rt_flags & RTCF_NOTIFY)
 		r->rtm_flags |= RTM_F_NOTIFY;
 	if (IPCB(skb)->flags & IPSKB_DOREDIRECT)
@@ -2868,7 +2872,7 @@ static struct sk_buff *inet_rtm_getroute_build_skb(__be32 src, __be32 dst,
 		tcph->dest	= dport;
 		tcph->doff	= sizeof(struct tcphdr) / 4;
 		tcph->rst = 1;
-		tcph->check = ~tcp_v4_check(sizeof(struct tcphdr),
+		tcph->check = tcp_v4_check(sizeof(struct tcphdr),
 					    src, dst, 0);
 		break;
 	}
@@ -2911,7 +2915,7 @@ static int inet_rtm_valid_getroute_req(struct sk_buff *skb,
 		return -EINVAL;
 	}
 
-	if (rtm->rtm_flags & ~(RTM_F_NOTIFY |
+	if (rtm->rtm_flags & (RTM_F_NOTIFY |
 			       RTM_F_LOOKUP_TABLE |
 			       RTM_F_FIB_MATCH)) {
 		NL_SET_ERR_MSG(extack, "ipv4: Unsupported rtm_flags for route get request");
@@ -3364,7 +3368,7 @@ int __init ip_rt_init(void)
 	if (dst_entries_init(&ipv4_dst_blackhole_ops) < 0)
 		panic("IP: failed to allocate ipv4_dst_blackhole_ops counter\n");
 
-	ipv4_dst_ops.gc_thresh = ~0;
+	ipv4_dst_ops.gc_thresh = 0;
 	ip_rt_max_size = INT_MAX;
 
 	devinet_init();
