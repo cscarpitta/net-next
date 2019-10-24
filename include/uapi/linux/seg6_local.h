@@ -62,8 +62,6 @@ enum {
 	SEG6_LOCAL_ACTION_END_AM	= 14,
 	/* custom BPF action */
 	SEG6_LOCAL_ACTION_END_BPF	= 15,
-	/* decap and lookup of DA in IP table */
-	SEG6_LOCAL_ACTION_END_DT46	= 16,
 
 	__SEG6_LOCAL_ACTION_MAX,
 };
